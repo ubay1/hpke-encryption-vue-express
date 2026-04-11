@@ -4,6 +4,168 @@ import {
   DhkemP256HkdfSha256,
   HkdfSha256,
 } from "@hpke/core";
+import {
+  concatUint8Arrays,
+  uint8ArrayToBase64,
+  base64ToUint8Array,
+  stringToUint8Array,
+  uint8ArrayToString,
+} from "uint8array-extras";
+
+// ─── Seal/Unseal Wrapper Functions (from operation.ts) ─────
+
+// Min 3, Max 9
+const WRAPPER_LENGTH = 5
+
+// Taken and modified from
+// https://github.com/validatorjs/validator.js/blob/master/src/lib/isBase64.js
+const isBase64String = (str: string) => {
+  const notBase64 = /[^A-Z0-9+/=]/i
+  const len = str.length
+
+  if (len % 4 !== 0 || notBase64.test(str)) {
+    return false
+  }
+
+  const firstPaddingChar = str.indexOf('=')
+
+  return (
+    firstPaddingChar === -1 || firstPaddingChar === len - 1 || (firstPaddingChar === len - 2 && str[len - 1] === '=')
+  )
+}
+
+// Use native crypto (available in both browser and Node.js 19+)
+const getRandomValues = (array: Uint32Array): Uint32Array => {
+  const crypto = typeof globalThis.crypto !== 'undefined' && globalThis.crypto
+    ? globalThis.crypto
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    : ((globalThis as any).require('crypto') as { webcrypto: Crypto }).webcrypto
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  crypto.getRandomValues(array as any)
+  return array
+}
+
+// Advices from https://github.com/gkouziik/eslint-plugin-security-node/blob/master/docs/rules/detect-insecure-randomness.md
+// Divide a random UInt32 by the maximum value (2^32 -1) to get a result between 0 and 1
+const secureMathRandom = () => getRandomValues(new Uint32Array(1))[0] / 4294967295
+
+// Taken from https://www.programiz.com/javascript/examples/generate-random-strings
+const generateWrapperString = () =>
+  secureMathRandom()
+    .toString(36)
+    .substring(2, 2 + WRAPPER_LENGTH)
+
+const wrapBase64 = (base64: string) => {
+  const prefix = generateWrapperString()
+  const suffix = prefix
+
+  // Count padding
+  const paddingMatch = base64.match(/=+$/)
+  const paddingCount = paddingMatch ? paddingMatch[0].length : 0
+
+  // Remove padding from base64
+  const base64WithoutPadding = base64.replace(/=+$/, '')
+
+  // Format: prefix + base64WithoutPadding + suffix + paddingCount
+  return `${prefix}${base64WithoutPadding}${suffix}${paddingCount}`
+}
+
+const unwrapBase64 = (str: string) => {
+  const strLength = str.length
+
+  // Extract prefix (first 5 chars)
+  const prefix = str.substring(0, WRAPPER_LENGTH)
+
+  // Extract suffix (5 chars before the last digit)
+  const suffix = str.substring(strLength - WRAPPER_LENGTH - 1, strLength - 1)
+
+  // Extract padding count (last digit)
+  const paddingCount = parseInt(str.substring(strLength - 1), 10)
+
+  // Validate prefix matches suffix
+  if (prefix === suffix) {
+    // Extract base64 (between prefix and suffix)
+    const base64WithoutPadding = str.substring(WRAPPER_LENGTH, strLength - WRAPPER_LENGTH - 1)
+
+    // Add padding back
+    const padding = '='.repeat(paddingCount)
+    const result = base64WithoutPadding + padding
+
+    return result
+  }
+
+  return str
+}
+
+/**
+ * Seal data using recipient's public key
+ * Returns a wrapped base64 string containing ciphertext + encapsulated key
+ */
+export const seal = async (suite: CipherSuite, publicKeyB64: string, plainText: string) => {
+  const publicKey = base64ToArrayBuffer(publicKeyB64)
+  const { ct: cipherText, enc: encapsulatedKey } = await suite.seal(
+    {
+      recipientPublicKey: await suite.kem.importKey('raw', publicKey),
+    },
+    new TextEncoder().encode(plainText),
+  )
+
+  const header = stringToUint8Array(`${cipherText.byteLength}`)
+
+  const base64Result = uint8ArrayToBase64(
+    concatUint8Arrays([
+      // index 0 --> index 1
+      new Uint8Array([header.byteLength]),
+      // index 1 --> index (header.byteLength + 1)
+      header,
+      // index (header.byteLength + 1) --> (header.byteLength + 1) + parseInt(header)
+      new Uint8Array(cipherText),
+      // (header.byteLength + 1) + parseInt(header) --> end
+      new Uint8Array(encapsulatedKey),
+    ]),
+  )
+
+  const wrappedResult = wrapBase64(base64Result)
+
+  return wrappedResult
+}
+
+/**
+ * Unseal data using your private key
+ * Accepts a wrapped base64 string and returns the decrypted plaintext
+ */
+export const unseal = async (suite: CipherSuite, privateKey: CryptoKey, cipher: string) => {
+  const unwrappedCipher = unwrapBase64(cipher)
+
+  if (isBase64String(unwrappedCipher)) {
+    try {
+      const data = base64ToUint8Array(unwrappedCipher)
+
+      const headerSize = data[0] ?? 0
+      const cipherSize = parseInt(uint8ArrayToString(data.subarray(1, headerSize + 1)), 10)
+      const cipherStart = headerSize + 1
+      const cipherEnd = headerSize + 1 + cipherSize
+      const cipherText = data.subarray(cipherStart, cipherEnd)
+      const encapsulatedKey = data.subarray(cipherEnd)
+
+      return new TextDecoder().decode(
+        await suite.open(
+          {
+            recipientKey: privateKey,
+            enc: encapsulatedKey,
+          },
+          cipherText,
+        ),
+      )
+    } catch (error) {
+      console.error('unseal error:', error)
+      throw error
+    }
+  }
+
+  return cipher
+}
 
 export const suite = new CipherSuite({
   kem: new DhkemP256HkdfSha256(),
@@ -58,9 +220,10 @@ export async function importPublicKey(jwk: JsonWebKey): Promise<CryptoKey> {
 // ─── Encrypt / Decrypt ─────────────────────────────────────
 
 export interface HpkeEncryptedData {
-  ciphertext: string; // base64
-  enc: string; // base64
-  encrypted?: string; // combined base64 string (optional, for convenience)
+  ciphertext?: string; // base64
+  enc?: string; // base64
+  encrypted?: string; // combined base64 string (old format)
+  sealed?: string; // sealed wrapped string (new format)
 }
 
 /**
@@ -81,7 +244,6 @@ export async function hpkeEncrypt(
   return {
     ciphertext: ciphertextB64,
     enc: encB64,
-    // Combined string for easy copy-paste
     encrypted: btoa(JSON.stringify({ ciphertext: ciphertextB64, enc: encB64 })),
   };
 }
@@ -93,7 +255,12 @@ export async function hpkeDecrypt(
   encrypted: HpkeEncryptedData,
   privateKey: CryptoKey
 ): Promise<string> {
-  // Handle combined string format
+  // Handle sealed format first
+  if (encrypted.sealed) {
+    return await unseal(suite, privateKey, encrypted.sealed)
+  }
+
+  // Handle combined string format (old)
   let ciphertext: string
   let enc: string
 
@@ -102,8 +269,8 @@ export async function hpkeDecrypt(
     ciphertext = parsed.ciphertext
     enc = parsed.enc
   } else {
-    ciphertext = encrypted.ciphertext
-    enc = encrypted.enc
+    ciphertext = encrypted.ciphertext!
+    enc = encrypted.enc!
   }
 
   const recipient = await suite.createRecipientContext({
@@ -119,16 +286,10 @@ export async function hpkeDecrypt(
 
 const SERVER_URL = "http://localhost:9002";
 
-export async function getServerPublicKey(): Promise<JsonWebKey> {
-  const res = await fetch(`${SERVER_URL}/api/public-key`);
+export async function getServerPublicKeyRaw(): Promise<string> {
+  const res = await fetch(`${SERVER_URL}/api/server-public-key`);
   const data = await res.json();
-  return publicKeyFromString(data.publicKeyString);
-}
-
-export async function getServerPublicKeyString(): Promise<string> {
-  const res = await fetch(`${SERVER_URL}/api/public-key`);
-  const data = await res.json();
-  return data.publicKeyString;
+  return data.data;
 }
 
 export async function serverEncrypt(
@@ -144,16 +305,6 @@ export async function serverEncrypt(
     }),
   });
   return await res.json();
-}
-
-export async function serverDecrypt(encrypted: HpkeEncryptedData): Promise<string> {
-  const res = await fetch(`${SERVER_URL}/api/decrypt`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ encrypted: encrypted.encrypted }),
-  });
-  const data = await res.json();
-  return data.data;
 }
 
 export async function serverEncryptForClient(
@@ -173,5 +324,50 @@ export async function serverEncryptForClient(
       clientPublicKey: clientPublicKeyString,
     }),
   });
+  const result = await res.json();
+
+  // Server now returns { sealed: "..." } format
+  if (result.sealed) {
+    return { sealed: result.sealed };
+  }
+
+  // Fallback to old format
+  return result;
+}
+
+// ─── Server Seal/Unseal API Helpers ──────────────────────────
+
+export async function serverSeal(
+  data: string,
+  serverPublicKey: JsonWebKey
+): Promise<{ sealed: string }> {
+  const res = await fetch(`${SERVER_URL}/api/seal`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      data,
+      recipientPublicKey: publicKeyToString(serverPublicKey),
+    }),
+  });
   return await res.json();
+}
+
+export async function serverUnseal(sealed: string): Promise<string> {
+  const res = await fetch(`${SERVER_URL}/api/unseal`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sealed }),
+  });
+  const data = await res.json();
+  return data.data;
+}
+
+export async function serverDecrypt(encrypted: HpkeEncryptedData): Promise<string> {
+  const res = await fetch(`${SERVER_URL}/api/decrypt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ encrypted: encrypted.encrypted }),
+  });
+  const data = await res.json();
+  return data.data;
 }
